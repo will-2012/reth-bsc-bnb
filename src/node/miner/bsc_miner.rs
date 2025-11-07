@@ -507,13 +507,11 @@ where
             handle.abort();
         }
         
-        let parent_snapshot = mining_ctx.parent_snapshot.clone();
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
             self.parlia.clone(), 
-            &parent_snapshot, 
             &parent_header, 
             self.validator_address
         );

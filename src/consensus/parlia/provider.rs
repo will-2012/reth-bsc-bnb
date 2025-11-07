@@ -283,7 +283,14 @@ impl<DB: Database + 'static> EnhancedDbSnapshotProvider<DB> {
                 turn_length,
                 &*self.chain_spec,
             ) {
-                Some(snap) => snap,
+                Some(snap) => {
+                    tracing::trace!(
+                        "Successfully applied header: block_number={}, recent_proposers_count={}, recent_proposers_keys={:?}",
+                        snap.block_number, snap.recent_proposers.len(), 
+                        snap.recent_proposers.keys().collect::<Vec<_>>()
+                    );
+                    snap
+                },
                 None => {
                     tracing::warn!("Failed to apply header {} to snapshot", header.number);
                     return None;
