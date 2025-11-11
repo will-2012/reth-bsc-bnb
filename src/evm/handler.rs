@@ -5,7 +5,7 @@ use crate::evm::{
     blacklist,
 };
 
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{U256};
 use reth_evm::Database;
 use revm::{bytecode::Bytecode, primitives::eip7702};
 
@@ -23,8 +23,7 @@ use revm::{
     primitives::hardfork::SpecId,
 };
 
-const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
-
+use crate::consensus::SYSTEM_ADDRESS;
 pub struct BscHandler<DB: revm::database::Database, INSP> {
     pub mainnet: MainnetHandler<BscEvm<DB, INSP>, EVMError<DB::Error>, EthFrame>,
 }
@@ -81,7 +80,7 @@ impl<DB: Database, INSP> Handler for BscHandler<DB, INSP> {
                 continue;
             };
 
-            // BSC specific validation on https://github.com/bnb-chain/bsc/blob/develop/core/state_transition.go#L593
+            // check if authority is blacklisted.
             if blacklist::is_blacklisted(&authority) {
                 continue;
             }

@@ -10,14 +10,14 @@ use revm::{
     primitives::{Address, Bytes, TxKind, U256},
 };
 use alloy_consensus::{TxReceipt, Header, BlockHeader};
-use alloy_primitives::B256;
-use crate::consensus::parlia::{VoteAddress, Snapshot, Parlia, DIFF_INTURN, DIFF_NOTURN};
-use crate::consensus::parlia::util::{is_breathe_block, calculate_millisecond_timestamp};
+use alloy_primitives::{BlockHash, BlockNumber, B256};
+use crate::consensus::parlia::{VoteAddress, Snapshot, DIFF_INTURN, DIFF_NOTURN};
+use crate::consensus::parlia::util::{is_breathe_block, debug_header};
 use crate::consensus::parlia::vote::MAX_ATTESTATION_EXTRA_LENGTH;
-use crate::node::evm::error::BscBlockExecutionError;
+use crate::node::evm::error::{BscBlockExecutionError, BscBlockValidationError};
 use crate::node::evm::util::HEADER_CACHE_READER;
 use crate::system_contracts::feynman_fork::ValidatorElectionInfo;
-use std::{collections::HashMap, sync::{Arc, LazyLock, Mutex}};
+use std::{collections::HashMap, sync::{LazyLock, Mutex}};
 use schnellru::{ByLength, LruMap};
 use reth_primitives::GotExpected;
 use blst::{
@@ -28,12 +28,18 @@ use bit_set::BitSet;
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-type ValidatorCache = LruMap<u64, (Vec<Address>, Vec<VoteAddress>), ByLength>;
+const K_ANCESTOR_GENERATION_DEPTH: u64 = 3;
 
-static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
+type ValidatorCache = LruMap<BlockHash, (Vec<Address>, Vec<VoteAddress>), ByLength>;
+type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
+
+pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
     Mutex::new(LruMap::new(ByLength::new(1024)))
 });
 
+pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|| {
+    Mutex::new(LruMap::new(ByLength::new(1024)))
+});
 
 impl<'a, DB, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
@@ -60,17 +66,13 @@ where
         let block_number = block.number.to::<u64>();
         tracing::trace!("Check new block, block_number: {}", block_number);
 
-        let header = crate::node::evm::util::HEADER_CACHE_READER
-            .lock()
-            .unwrap()
-            .get_header_by_number(block_number)
-            .ok_or(BlockExecutionError::msg("Failed to get header from global header reader"))?;
-        self.inner_ctx.header = Some(header.clone());
+        self.inner_ctx.header = self.ctx.header.clone();
+        let header = self.inner_ctx.header.clone().unwrap();
 
         let parent_header = crate::node::evm::util::HEADER_CACHE_READER
             .lock()
             .unwrap()
-            .get_header_by_number(block_number - 1)
+            .get_header_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
@@ -78,15 +80,16 @@ where
             .snapshot_provider
             .as_ref()
             .unwrap()
-            .snapshot(block_number-1)
+            .snapshot_by_hash(&header.parent_hash)
             .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
 
         self.verify_cascading_fields(&header, &parent_header, &snap)?;
 
-        let epoch_length = self.parlia.get_epoch_length(&header);
-        if header.number % epoch_length == 0 {
-            let (validator_set, vote_addresses) = self.get_current_validators(header.number-1 /*mostly in cache*/)?;
+        let epoch_length = snap.epoch_num;
+        if header.number.is_multiple_of(epoch_length) {
+            // TODO: need fix it later, it may got error when restart the node?
+            let (validator_set, vote_addresses) = self.get_current_validators(header.number-1, header.parent_hash)?;
             tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
             
             let vote_addrs_map = if vote_addresses.is_empty() {
@@ -100,10 +103,22 @@ where
             };
             tracing::debug!("vote_addrs_map: {:?}", vote_addrs_map);
             self.inner_ctx.current_validators = Some((validator_set, vote_addrs_map));
+
+            // Also fetch on-chain NodeIDs for validators (EVN identification) and update cache.
+            // Only available after Maxwell hardfork when StakeHub contract's getNodeIDs is deployed
+            if self.spec.is_maxwell_active_at_timestamp(header.number, header.timestamp) {
+                let (to2, data2) = self.system_contracts.get_node_ids(self.inner_ctx.current_validators.as_ref().unwrap().0.clone());
+                if let Ok(output2) = self.eth_call(to2, data2) {
+                    let (_consensus_addrs, node_ids_list) = self.system_contracts.unpack_data_into_node_ids(&output2);
+                    let mut flat: Vec<[u8; 32]> = Vec::new();
+                    for ids in node_ids_list { for id in ids { flat.push(id); } }
+                    crate::node::network::evn_peers::update_onchain_nodeids(flat);
+                }
+            }
         }
     
         if self.spec.is_feynman_active_at_timestamp(header.number, header.timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header.timestamp, parent_header.timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header.number, header.timestamp, parent_header.timestamp) &&
             is_breathe_block(parent_header.timestamp, header.timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
@@ -145,13 +160,14 @@ where
 
     pub(crate) fn get_current_validators(
         &mut self, 
-        block_number: u64
+        block_number: BlockNumber,
+        block_hash: BlockHash
     ) -> Result<(Vec<Address>, Vec<VoteAddress>), BlockExecutionError> {
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            if let Some(cached_result) = cache.get(&block_number) {
-                tracing::debug!("Succeed to query cached validator result, block_number: {}, evm_block_number: {}", 
-                    block_number, self.evm.block().number);
+            if let Some(cached_result) = cache.get(&block_hash) {
+                tracing::debug!("Succeed to query cached validator result, block_number: {}, block_hash: {}, evm_block_number: {}", 
+                block_number, block_hash, self.evm.block().number);
                 return Ok(cached_result.clone());
             }
         }
@@ -169,9 +185,9 @@ where
 
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
-            cache.insert(block_number, result.clone());
-            tracing::debug!("Succeed to update cache, block_number: {}, evm_block_number: {}", 
-                block_number, self.evm.block().number);
+            cache.insert(block_hash, result.clone());
+            tracing::debug!("Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}", 
+                block_number, block_hash, self.evm.block().number);
         }
 
         Ok(result)
@@ -230,23 +246,7 @@ where
         header: &Header,
         parent: &Header,
     ) -> Result<(), BlockExecutionError> {
-        if self.spec.is_ramanujan_active_at_block(header.number()) {
-            let block_interval = snap.block_interval;
-            // TODO: recheck it, maybe still has bugs.
-            let back_off_time = self.parlia.back_off_time(snap, parent, header);
-            let current_ts: u64 = calculate_millisecond_timestamp(header);
-            let parent_ts: u64 = calculate_millisecond_timestamp(parent);
-            if current_ts < parent_ts + block_interval + back_off_time {
-                tracing::warn!("Block time is too early, block_number: {}, ts: {:?}, parent_ts: {:?}, block_interval: {:?}, back_off_time: {:?}", 
-                    header.number(), current_ts, parent_ts, block_interval, back_off_time);
-                return Err(BscBlockExecutionError::FutureBlock {
-                    block_number: header.number(),
-                    hash: header.hash_slow(),
-                }
-                .into());
-            }
-        }
-        Ok(())
+        self.parlia.block_time_verify_for_ramanujan_fork(snap, header, parent)
     }
 
     fn verify_vote_attestation(
@@ -259,30 +259,46 @@ where
             return Ok(());
         }
 
-        let parlia = Parlia::new(Arc::new(self.spec.clone()), 200);
         let attestation =
-            parlia.get_vote_attestation_from_header(header, snap.epoch_num).map_err(|err| {
+            self.parlia.get_vote_attestation_from_header(header, snap.epoch_num).map_err(|err| {
                 tracing::error!("Failed to get vote attestation from header, block_number: {}, error: {:?}", header.number(), err);
-                BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+                BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
             })?;
         if let Some(attestation) = attestation {
             if attestation.extra.len() > MAX_ATTESTATION_EXTRA_LENGTH {
-                return Err(BscBlockExecutionError::TooLargeAttestationExtraLen {
-                    extra_len: MAX_ATTESTATION_EXTRA_LENGTH,
-                }
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::TooLargeAttestationExtraLen {
+                        extra_len: MAX_ATTESTATION_EXTRA_LENGTH,
+                    }
+                ).into());
             }
     
             // the attestation target block should be direct parent.
             let target_block = attestation.data.target_number;
             let target_hash = attestation.data.target_hash;
-            if target_block != parent.number() || target_hash != parent.hash_slow() {
-                return Err(BscBlockExecutionError::InvalidAttestationTarget {
-                    block_number: GotExpected { got: target_block, expected: parent.number() },
-                    block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
-                        .into(),
+            let mut is_match = false;
+            let mut ancestor = parent.clone();
+            for _ in 0..self.get_ancestor_generation_depth(header) {
+                if ancestor.number() == target_block && ancestor.hash_slow() == target_hash {
+                    is_match = true;
+                    break;
                 }
-                .into());
+                ancestor = crate::node::evm::util::HEADER_CACHE_READER
+                    .lock()
+                    .unwrap()
+                    .get_header_by_hash(&ancestor.parent_hash())
+                    .ok_or_else(|| BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() })?;
+                tracing::debug!("ancestor: {:?}", ancestor);
+            }
+
+            if !is_match {
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationTarget {
+                        block_number: GotExpected { got: target_block, expected: parent.number() },
+                        block_hash: GotExpected { got: target_hash, expected: parent.hash_slow() }
+                            .into(),
+                    }
+                ).into());
             }
     
             // the attestation source block should be the highest justified block.
@@ -291,19 +307,20 @@ where
             
             let justified = self.get_justified_header(snap)?;
             if source_block != justified.number() || source_hash != justified.hash_slow() {
-                return Err(BscBlockExecutionError::InvalidAttestationSource {
-                    block_number: GotExpected { got: source_block, expected: justified.number() },
-                    block_hash: GotExpected { got: source_hash, expected: justified.hash_slow() }
-                        .into(),
-                }
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationSource {
+                        block_number: GotExpected { got: source_block, expected: justified.number() },
+                        block_hash: GotExpected { got: source_hash, expected: justified.hash_slow() }
+                            .into(),
+                    }
+                ).into());
             }
 
             let pre_snap = self
                 .snapshot_provider
                 .as_ref()
                 .unwrap()
-                .snapshot(parent.number() - 1)
+                .snapshot_by_hash(&parent.parent_hash)
                 .ok_or(BlockExecutionError::msg("Failed to get pre snapshot from snapshot provider"))?;
 
             // query bls keys from snapshot.
@@ -313,11 +330,12 @@ where
             );
             let bit_set_count = vote_bit_set.len();
             if bit_set_count > validators_count {
-                return Err(BscBlockExecutionError::InvalidAttestationVoteCount(GotExpected {
-                    got: bit_set_count as u64,
-                    expected: validators_count as u64,
-                })
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                        got: bit_set_count as u64,
+                        expected: validators_count as u64,
+                    })
+                ).into());
             }
              
             let mut vote_addrs: Vec<VoteAddress> = Vec::with_capacity(bit_set_count);
@@ -336,11 +354,12 @@ where
             // check if voted validator count satisfied 2/3 + 1
             let at_least_votes = (validators_count * 2).div_ceil(3); // ceil division
             if vote_addrs.len() < at_least_votes {
-                return Err(BscBlockExecutionError::InvalidAttestationVoteCount(GotExpected {
-                    got: vote_addrs.len() as u64,
-                    expected: at_least_votes as u64,
-                })
-                .into());
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                        got: vote_addrs.len() as u64,
+                        expected: at_least_votes as u64,
+                    })
+                ).into());
             }
  
             // check bls aggregate sig
@@ -368,44 +387,71 @@ where
         Ok(())
     }
 
+    fn get_ancestor_generation_depth(&self, header: &Header) -> u64 {
+        if self.spec.is_fermi_active_at_timestamp(header.number(),header.timestamp) {
+            return K_ANCESTOR_GENERATION_DEPTH;
+        }
+        1
+    }
+
     
     fn verify_seal(
         &self,
         snap: &Snapshot,
         header: &Header,
     ) -> Result<(), BlockExecutionError> {
-        let parlia = Parlia::new(Arc::new(self.spec.clone()), 200);
-        let proposer = parlia.recover_proposer(header).map_err(|err| {
+        let proposer = self.parlia.recover_proposer(header).map_err(|err| {
             tracing::error!("Failed to recover proposer from header, block_number: {}, error: {:?}", header.number(), err);
-            BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+            BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
         })?;
 
         if proposer != header.beneficiary {
-            return Err(BscBlockExecutionError::WrongHeaderSigner {
-                block_number: header.number(),
-                signer: GotExpected { got: proposer, expected: header.beneficiary }.into(),
-            }
-            .into());
+            tracing::error!("Wrong header signer, block_number: {}, proposer: {:?}, expected: {:?}", 
+                header.number(), proposer, header.beneficiary);
+            debug_header(header, self.spec.chain().id(), "verify_seal_header");
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::WrongHeaderSigner {
+                    block_number: header.number(),
+                    signer: GotExpected { got: proposer, expected: header.beneficiary }.into(),
+                }
+            ).into());
         }
 
         if !snap.validators.contains(&proposer) {
-            return Err(BscBlockExecutionError::SignerUnauthorized { 
-                block_number: header.number(), 
-                proposer 
-            }.into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::SignerUnauthorized { 
+                    block_number: header.number(), 
+                    proposer 
+                }
+            ).into());
         }
 
         if snap.sign_recently(proposer) {
-            return Err(BscBlockExecutionError::SignerOverLimit { proposer }.into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::SignerOverLimit { proposer }
+            ).into());
         }
 
         let is_inturn = snap.is_inturn(proposer);
         if (is_inturn && header.difficulty != DIFF_INTURN) ||
             (!is_inturn && header.difficulty != DIFF_NOTURN)
         {
-            return Err(
-                BscBlockExecutionError::InvalidDifficulty { difficulty: header.difficulty }.into()
+            let expected_difficulty = if is_inturn { DIFF_INTURN } else { DIFF_NOTURN };
+            tracing::warn!(
+                target: "bsc::validation",
+                block_number = header.number(),
+                block_hash = ?header.hash_slow(),
+                proposer = ?proposer,
+                is_inturn,
+                actual_difficulty = %header.difficulty,
+                expected_difficulty = %expected_difficulty,
+                diff_inturn = %DIFF_INTURN,
+                diff_noturn = %DIFF_NOTURN,
+                "Block difficulty validation failed: mismatch between inturn status and difficulty"
             );
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::InvalidDifficulty { difficulty: header.difficulty }
+            ).into());
         }
 
         Ok(())
@@ -432,5 +478,66 @@ where
             .ok_or_else(|| {
                 BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }.into()
             })
+    }
+
+    /// prepare some intermediate data for produce new block.
+    pub(crate) fn prepare_new_block(
+        &mut self, 
+        block: &BlockEnv
+    ) -> Result<(), BlockExecutionError> {
+        let parent_header = crate::node::evm::util::HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .get_header_by_hash(&self.ctx.base.parent_hash)
+            .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        self.inner_ctx.parent_header = Some(parent_header.clone());
+        let snap = self
+            .snapshot_provider
+            .as_ref()
+            .unwrap()
+            .snapshot_by_hash(&self.ctx.base.parent_hash)
+            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        self.inner_ctx.snap = Some(snap.clone());
+
+        let header_number = block.number.to::<u64>();
+        let header_timestamp = block.timestamp.to::<u64>();
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
+            is_breathe_block(parent_header.timestamp, header_timestamp)
+        {
+            let (to, data) = self.system_contracts.get_max_elected_validators();
+            let bz = self.eth_call(to, data)?;
+            let max_elected_validators = self.system_contracts.unpack_data_into_max_elected_validators(bz.as_ref());
+            tracing::debug!("max_elected_validators: {:?}", max_elected_validators);
+            self.inner_ctx.max_elected_validators = Some(max_elected_validators);
+
+            let (to, data) = self.system_contracts.get_validator_election_info();
+            let bz = self.eth_call(to, data)?;
+
+            let (validators, voting_powers, vote_addrs, total_length) =
+                self.system_contracts.unpack_data_into_validator_election_info(bz.as_ref());
+
+            let total_length = total_length.to::<u64>() as usize;
+            if validators.len() != total_length ||
+                voting_powers.len() != total_length ||
+                vote_addrs.len() != total_length
+            {
+                return Err(BlockExecutionError::msg("Failed to get top validators"));
+            }
+
+            let validator_election_info: Vec<ValidatorElectionInfo> = validators
+                .into_iter()
+                .zip(voting_powers)
+                .zip(vote_addrs)
+                .map(|((validator, voting_power), vote_addr)| ValidatorElectionInfo {
+                    address: validator,
+                    voting_power,
+                    vote_address: vote_addr,
+                })
+                .collect();
+            tracing::debug!("validator_election_info: {:?}", validator_election_info);
+            self.inner_ctx.validators_election_info = Some(validator_election_info);
+        }
+        Ok(())
     }
 }

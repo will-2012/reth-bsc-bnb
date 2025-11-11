@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 use lazy_static::lazy_static;
@@ -7,6 +8,13 @@ use schnellru::LruMap;
 use schnellru::ByLength;
 use alloy_primitives::{Address, B256};
 use secp256k1::{SECP256K1, Message, ecdsa::{RecoveryId, RecoverableSignature}};
+use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
+use crate::consensus::parlia::util::is_breathe_block;
+use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash;
+use crate::consensus::parlia::VoteData;
+use crate::consensus::parlia::VoteSignature;
+use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
+use crate::consensus::parlia::SYSTEM_TXS_GAS_SOFT_LIMIT;
 use crate::hardforks::BscHardforks;
 use reth_chainspec::EthChainSpec;
 use alloy_consensus::{Header, BlockHeader};
@@ -19,10 +27,11 @@ use super::{
     },
     hash_with_chain_id,
     provider::ValidatorsInfo,
+    util::set_millisecond_part_of_timestamp,
     BACKOFF_TIME_OF_INITIAL, BACKOFF_TIME_OF_WIGGLE, DEFAULT_TURN_LENGTH,LORENTZ_BACKOFF_TIME_OF_INITIAL,
 };
 use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
-use tracing::{trace, debug};
+use tracing::{trace, debug, warn};
 
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
@@ -32,7 +41,7 @@ lazy_static! {
     static ref RECOVERED_PROPOSER_CACHE: RwLock<LruMap<B256, Address, ByLength>> = RwLock::new(LruMap::new(ByLength::new(RECOVERED_PROPOSER_CACHE_NUM as u32)));
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Parlia<ChainSpec> {
     pub spec: Arc<ChainSpec>,
     pub epoch: u64, // The epoch number
@@ -185,17 +194,29 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         let signature_bytes = &extra_data[signature_offset..signature_offset + EXTRA_SEAL_LEN - 1];
 
         let recovery_id = RecoveryId::try_from(recovery_byte)
-            .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+            .map_err(|err| {
+                tracing::error!("Failed to create RecoveryId from recovery_byte {}: {}", recovery_byte, err);
+                ParliaConsensusError::RecoverECDSAInnerError
+            })?;
         let signature = RecoverableSignature::from_compact(signature_bytes, recovery_id)
-            .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+            .map_err(|err| {
+                tracing::error!("Failed to recover signature from signature_bytes (len={}), recovery_id={}: {}", signature_bytes.len(), recovery_byte, err);
+                ParliaConsensusError::RecoverECDSAInnerError
+            })?;
 
         let message = Message::from_digest_slice(
                             hash_with_chain_id(header, self.spec.chain().id()).as_slice(),
         )
-        .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+        .map_err(|err| {
+            tracing::error!("Failed to create Message from hash digest: {}", err);
+            ParliaConsensusError::RecoverECDSAInnerError
+        })?;
         let public = &SECP256K1
             .recover_ecdsa(&message, &signature)
-            .map_err(|_| ParliaConsensusError::RecoverECDSAInnerError)?;
+            .map_err(|err| {
+                tracing::error!("Failed to recover ECDSA public key from message and signature: {}", err);
+                ParliaConsensusError::RecoverECDSAInnerError
+            })?;
 
         let proposer =
             Address::from_slice(&alloy_primitives::keccak256(&public.serialize_uncompressed()[1..])[12..]);
@@ -208,8 +229,8 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         Ok(proposer)
     }
     
-    pub fn present_timestamp(&self) -> u64 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs()
+    pub fn present_millis_timestamp(&self) -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
     fn get_validator_len_from_header(
@@ -352,6 +373,17 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
     /// return the back off milliseconds of the validator, 0 if the validator is in turn.
     pub fn back_off_time(&self, snap: &Snapshot, parent: &Header, header: &Header) -> u64 {
         let validator = header.beneficiary;
+        
+        tracing::trace!(
+            target: "bsc::consensus::back_off_time",
+            block_number = header.number,
+            validator = ?validator,
+            snapshot_block = snap.block_number,
+            recent_proposers_count = snap.recent_proposers.len(),
+            recent_proposers = ?snap.recent_proposers,
+            "Calculating back_off_time"
+        );
+        
         if snap.is_inturn(validator) {
             return 0;
         }
@@ -365,6 +397,14 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
 
         if self.spec.is_planck_active_at_block(header.number) {
             let counts = snap.count_recent_proposers();
+            
+            tracing::trace!(
+                target: "bsc::consensus::back_off_time",
+                block_number = header.number,
+                counts = ?counts,
+                "Counted recent proposers"
+            );
+            
             if snap.sign_recently_by_counts(validator, &counts) {
                 // The backOffTime does not matter when a validator has signed recently.
                 return 0;
@@ -385,29 +425,85 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
                     self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) &&
                         *addr == inturn_addr)
             });
+            
+            tracing::trace!(
+                target: "bsc::consensus::back_off_time",
+                block_number = header.number,
+                validators_after_filter = ?validators,
+                validators_count = validators.len(),
+                "Filtered validators"
+            );
         }
 
-        let mut rng = if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
+        let is_bohr = self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
+        let mut rng = if is_bohr {
             let turn_length = snap.turn_length.unwrap_or(DEFAULT_TURN_LENGTH);
-            RngSource::new(header.number as i64 / turn_length as i64)
+            let seed = header.number as i64 / turn_length as i64;
+            tracing::trace!(
+                target: "bsc::consensus::back_off_time",
+                block_number = header.number,
+                header_timestamp = header.timestamp,
+                parent_timestamp = parent.timestamp,
+                is_bohr = true,
+                turn_length = turn_length,
+                seed = seed,
+                "RNG seed (Bohr)"
+            );
+            RngSource::new(seed)
         } else {
-            RngSource::new(snap.block_number as i64)
+            let seed = snap.block_number as i64;
+            tracing::trace!(
+                target: "bsc::consensus::back_off_time",
+                block_number = header.number,
+                header_timestamp = header.timestamp,
+                parent_timestamp = parent.timestamp,
+                is_bohr = false,
+                seed = seed,
+                "RNG seed (pre-Bohr)"
+            );
+            RngSource::new(seed)
         };
 
         let mut back_off_steps: Vec<u64> = (0..validators.len() as u64).collect();
+        tracing::trace!(
+            target: "bsc::consensus::back_off_time",
+            block_number = header.number,
+            back_off_steps_before_shuffle = ?back_off_steps,
+            "Before shuffle"
+        );
         back_off_steps.shuffle(&mut rng);
+        tracing::trace!(
+            target: "bsc::consensus::back_off_time",
+            block_number = header.number,
+            back_off_steps_after_shuffle = ?back_off_steps,
+            "After shuffle"
+        );
 
         // get the index of the current validator and its shuffled backoff time.
         for (idx, val) in validators.iter().enumerate() {
             if *val == validator {
-                if delay == 0 && is_parent_lorentz {
+                let result = if delay == 0 && is_parent_lorentz {
                     // If the in-turn validator has signed recently, the expected backoff times are [0, 2, 3, ...].
                     if back_off_steps[idx] == 0 {
-                        return 0;
+                        0
+                    } else {
+                        LORENTZ_BACKOFF_TIME_OF_INITIAL + (back_off_steps[idx]- 1) * BACKOFF_TIME_OF_WIGGLE
                     }
-                    return LORENTZ_BACKOFF_TIME_OF_INITIAL + (back_off_steps[idx]- 1) * BACKOFF_TIME_OF_WIGGLE
-                }
-                return delay + back_off_steps[idx] * BACKOFF_TIME_OF_WIGGLE
+                } else {
+                    delay + back_off_steps[idx] * BACKOFF_TIME_OF_WIGGLE
+                };
+                
+                tracing::trace!(
+                    target: "bsc::consensus::back_off_time",
+                    block_number = header.number,
+                    validator = ?validator,
+                    idx = idx,
+                    back_off_step = back_off_steps[idx],
+                    result = result,
+                    "Calculated back_off_time result"
+                );
+                
+                return result;
             }
         }
 
@@ -415,4 +511,186 @@ where ChainSpec: EthChainSpec + BscHardforks + 'static,
         0
     }
 
+    /// - `snap.block_interval` is used as the period (milliseconds).
+    /// - Applies `left_over_ms` reservation for finalization work.
+    /// - Caps blocking time to half the period when last block in one turn (or tl == 1),
+    ///   otherwise 4/5 of the period.
+    pub fn delay_for_mining(
+        &self,
+        snap: &Snapshot,
+        header: &Header,
+        left_over_ms: u64,
+    ) -> u64 {
+        let period_ms = snap.block_interval;
+        let mut delay_ms = self.delay_for_ramanujan_fork(snap, header);
+        if left_over_ms >= period_ms {
+            warn!("Delay invalid argument: left_over_ms={}, period_ms={}", left_over_ms, period_ms);
+        } else if left_over_ms >= delay_ms {
+            delay_ms = 0;
+        } else {
+            delay_ms -= left_over_ms;
+        }
+
+        let mut time_for_mining_ms = period_ms / 2;
+        let last_block_in_turn = snap.last_block_in_one_turn(header.number);
+        if !last_block_in_turn {
+            time_for_mining_ms = period_ms * 4 / 5;
+        }
+        if delay_ms > time_for_mining_ms {
+            delay_ms = time_for_mining_ms;
+        }
+
+        delay_ms
+    }
+
+    pub fn prepare_timestamp(&self, parent_snap: &Snapshot, parent_header: &Header, new_header: &mut Header) {
+        let millisecond_timestamp = self.block_time_for_ramanujan_fork(parent_snap, parent_header, new_header);
+        new_header.timestamp = millisecond_timestamp / 1000;
+        if self.spec.is_lorentz_active_at_timestamp(new_header.number, new_header.timestamp) {
+            set_millisecond_part_of_timestamp(millisecond_timestamp, new_header);
+        } else {
+            new_header.mix_hash = B256::ZERO;
+        }
+    }
+
+    pub fn prepare_validators(&self, snap: &Snapshot, validators: Option<(Vec<alloy_primitives::Address>, Vec<crate::consensus::parlia::VoteAddress>)>, new_header: &mut Header) {
+        let epoch_length = snap.epoch_num;
+        if !(new_header.number).is_multiple_of(epoch_length) {
+            return;
+        }
+        let Some((mut new_validators, vote_addresses)) = validators else {
+            return;
+        };
+
+        let mut extra_data = new_header.extra_data.to_vec();
+        if !self.spec.is_luban_active_at_block(new_header.number) {
+            // Pre-Luban: sort and append validator addresses directly to extra data
+            new_validators.sort();
+            for validator in &new_validators {
+                extra_data.extend_from_slice(validator.as_slice());
+            }
+        } else {
+            // Luban active: append validator count first, then validators with vote addresses
+            extra_data.push(new_validators.len() as u8);
+            
+            let mut vote_map = std::collections::HashMap::new();
+            if self.spec.is_luban_transition_at_block(new_header.number) {
+                // On Luban transition block, use zero BLS keys for all validators
+                let zero_bls_key = VoteAddress::ZERO;
+                for validator in &new_validators {
+                    vote_map.insert(*validator, zero_bls_key);
+                }
+            } else {
+                for (i, validator) in new_validators.iter().enumerate() {
+                    if i < vote_addresses.len() {
+                        vote_map.insert(*validator, vote_addresses[i]);
+                    } else {
+                        vote_map.insert(*validator, VoteAddress::ZERO);
+                    }
+                }
+            }
+            
+            new_validators.sort();
+            for validator in &new_validators {
+                extra_data.extend_from_slice(validator.as_slice());
+                extra_data.extend_from_slice(vote_map.get(validator).unwrap().as_slice());
+            }
+        }
+        new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
+    }
+
+    pub fn prepare_turn_length(&self, parent_snap: &Snapshot, new_header: &mut Header) -> Result<(), ParliaConsensusError> {
+        let epoch_length = parent_snap.epoch_num;
+        if !new_header.number.is_multiple_of(epoch_length) || !self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp) {
+            return Ok(());
+        }
+        
+        let mut cache = TURN_LENGTH_CACHE.lock().unwrap();
+        let turn_length = *cache.get(&new_header.parent_hash).ok_or(ParliaConsensusError::TurnLengthNotFound {
+            block_hash: new_header.parent_hash,
+        })?;
+        
+        let mut extra_data = new_header.extra_data.to_vec();
+        extra_data.push(turn_length);
+        new_header.extra_data = alloy_primitives::Bytes::from(extra_data);
+
+        Ok(())
+    }
+
+    pub fn estimate_gas_reserved_for_system_txs(&self, parent_timestamp: Option<u64>, current_number: u64, current_timestamp: u64) -> u64 {
+        if let Some(parent_timestamp) = parent_timestamp {
+            // Mainnet and Chapel have both passed Feynman. Now, simplify the logic before and during the Feynman hard fork.
+            if self.spec.is_feynman_active_at_timestamp(current_number, current_timestamp) &&
+                !self.spec.is_feynman_transition_at_timestamp(current_number, current_timestamp, parent_timestamp) &&
+                 !is_breathe_block(parent_timestamp, current_timestamp) {
+                // params.SystemTxsGasSoftLimit > (depositTxGas+slashTxGas+finalityRewardTxGas)*150/100
+                return SYSTEM_TXS_GAS_SOFT_LIMIT;
+            }
+        }
+        // params.SystemTxsGasHardLimit > (depositTxGas+slashTxGas+finalityRewardTxGas+updateValidatorTxGas)*150/100
+        SYSTEM_TXS_GAS_HARD_LIMIT
+    }
+    
+    pub fn assemble_vote_attestation(&self, parent_snap: &Snapshot, parent_header: &Header, current_header: &mut Header) -> Result<(), ParliaConsensusError> {
+        if !self.spec.is_luban_active_at_block(current_header.number()) || current_header.number() < 2 {
+            return Ok(());
+        }
+
+        let votes = fetch_vote_by_block_hash(current_header.parent_hash());
+        if votes.len() < usize::div_ceil(parent_snap.validators.len() * 2, 3) {
+            tracing::debug!(target: "parlia::consensus", "vote count is less than 2/3 of validators, skip assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
+                current_header.number(), current_header.parent_hash(), votes.len(), parent_snap.validators.len());
+            return Ok(());
+        }
+
+        tracing::debug!(target: "parlia::consensus", "assemble vote attestation, number={}, parent ={:?}, vote count={}, validators count={}", 
+            current_header.number(), current_header.parent_hash(), votes.len(), parent_snap.validators.len());
+        // get justified number and hash from parent snapshot
+        let (justified_number, justified_hash) = (parent_snap.vote_data.target_number, parent_snap.vote_data.target_hash);
+        let mut attestation = VoteAttestation::new_with_vote_data(VoteData {
+            source_number: justified_number,
+            source_hash: justified_hash,
+            target_number: parent_header.number,
+            target_hash: parent_header.hash_slow(),
+        });
+        // Check vote data from votes
+        for vote in votes.iter() {
+            if vote.data.hash() != attestation.data.hash() {
+                tracing::debug!(target: "parlia::consensus", "vote data hash mismatch, expected={:?}, got={:?}", attestation.data, vote);
+                return Err(ParliaConsensusError::FetchVoteError {
+                    address: vote.vote_address,
+                });
+            }
+        }
+        // Prepare aggregated vote signature and vote address set
+        let mut vote_addr_set: HashSet<VoteAddress> = HashSet::new();
+        let mut signatures: Vec<VoteSignature> = Vec::new();
+        for vote in votes.iter() {
+            vote_addr_set.insert(vote.vote_address);
+            signatures.push(vote.signature);
+        }
+        let sigs: Vec<blst::min_pk::Signature> = signatures.iter().map(|sig| blst::min_pk::Signature::from_bytes(sig.as_slice()).unwrap()).collect();
+        let sigs_ref: Vec<&blst::min_pk::Signature> = sigs.iter().collect();
+        let aggregate = blst::min_pk::AggregateSignature::aggregate(&sigs_ref, false)
+            .map_err(|_| ParliaConsensusError::AggregateSignatureError)?;
+        attestation.agg_signature.copy_from_slice(&aggregate.to_signature().to_bytes());
+        // Prepare vote address bitset.
+        for (_, val_info) in parent_snap.validators_map.iter() {
+            if vote_addr_set.contains(&val_info.vote_addr) {
+                attestation.vote_address_set |= 1 << (val_info.index - 1)
+            }
+        }
+        if attestation.vote_address_set.count_ones() < signatures.len() as u32 {
+            return Err(ParliaConsensusError::InvalidAttestationVoteCount {
+                got: attestation.vote_address_set.count_ones(),
+                expected: signatures.len() as u32,
+            });
+        }
+        // Append attestation to header extra field.
+        let mut extra_data = current_header.extra_data.to_vec();
+        let buf = alloy_rlp::encode(&attestation);
+        extra_data.extend_from_slice(buf.as_ref());
+        current_header.extra_data = alloy_primitives::Bytes::from(extra_data);
+        Ok(())
+    }
 }

@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
-//use crate::consensus::parlia::TURN_LENGTH_SIZE;
-
 use super::vote::{VoteAddress, VoteAttestation, VoteData};
-use alloy_primitives::{Address, BlockNumber, B256};
+use alloy_primitives::{Address, BlockNumber, BlockHash};
 use serde::{Deserialize, Serialize};
 use reth_db::table::{Compress, Decompress};
 use reth_db::DatabaseError;
@@ -30,6 +28,7 @@ pub const MAXWELL_TURN_LENGTH: u8 = 16;
 pub const DEFAULT_BLOCK_INTERVAL: u64 = 3000;   // 3000 ms
 pub const LORENTZ_BLOCK_INTERVAL: u64 = 1500;   // 1500 ms
 pub const MAXWELL_BLOCK_INTERVAL: u64 = 750;   //  750 ms
+pub const FERMI_BLOCK_INTERVAL: u64 = 450;   //  450 ms
 
 /// `ValidatorInfo` holds metadata for a validator at a given epoch.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -48,7 +47,7 @@ pub struct Snapshot {
     /// Block number of the epoch boundary.
     pub block_number: BlockNumber,
     /// Hash of that block.
-    pub block_hash: B256,
+    pub block_hash: BlockHash,
     /// Sorted validator set (ascending by address).
     pub validators: Vec<Address>,
     /// Extra information about validators (index + vote addr).
@@ -72,7 +71,7 @@ impl Snapshot {
     pub fn new(
         mut validators: Vec<Address>,
         block_number: BlockNumber,
-        block_hash: B256,
+        block_hash: BlockHash,
         epoch_num: u64,
         vote_addrs: Option<Vec<VoteAddress>>, // one-to-one with `validators`
     ) -> Self {
@@ -168,7 +167,7 @@ impl Snapshot {
                 }
             }
         }
-        snap.update_attestation(next_header, attestation);
+        snap.update_attestation(chain_spec,next_header, attestation);
         snap.recent_proposers.insert(block_number, validator);
 
         let is_maxwell_active = chain_spec.is_maxwell_active_at_timestamp(header_number, header_timestamp);
@@ -185,7 +184,10 @@ impl Snapshot {
         }
 
         let is_lorentz_active = chain_spec.is_lorentz_active_at_timestamp(header_number, header_timestamp);
-        if is_maxwell_active {
+        let is_fermi_active = chain_spec.is_fermi_active_at_timestamp(header_number, header_timestamp);
+        if is_fermi_active {
+            snap.block_interval = FERMI_BLOCK_INTERVAL;
+        } else if is_maxwell_active {
             snap.block_interval = MAXWELL_BLOCK_INTERVAL;
         } else if is_lorentz_active {
             snap.block_interval = LORENTZ_BLOCK_INTERVAL;
@@ -243,16 +245,19 @@ impl Snapshot {
         Some(snap)
     }
 
-    pub fn update_attestation<H>(&mut self, header: &H, attestation: Option<VoteAttestation>)
+    pub fn update_attestation<H, BscChainSpec>(&mut self, chain_spec: &BscChainSpec, header: &H, attestation: Option<VoteAttestation>)
     where
         H: alloy_consensus::BlockHeader + alloy_primitives::Sealable,
+        BscChainSpec: crate::hardforks::BscHardforks,
     {
         if let Some(att) = attestation {
-            let target_number = att.data.target_number;
-            let target_hash = att.data.target_hash;
-            if target_number+1 != header.number() || target_hash != header.parent_hash() {
-                tracing::warn!("Failed to update attestation, target_number: {:?}, target_hash: {:?}, header_number: {:?}, header_parent_hash: {:?}", target_number, target_hash, header.number(), header.parent_hash());
-                return;
+            if !chain_spec.is_fermi_active_at_timestamp(header.number(), header.timestamp()) {
+                let target_number = att.data.target_number;
+                let target_hash = att.data.target_hash;
+                if target_number+1 != header.number() || target_hash != header.parent_hash() {
+                    tracing::warn!("Failed to update attestation, target_number: {:?}, target_hash: {:?}, header_number: {:?}, header_parent_hash: {:?}", target_number, target_hash, header.number(), header.parent_hash());
+                    return;
+                }
             }
             if att.data.source_number+1 != att.data.target_number {
                 self.vote_data.target_number = att.data.target_number;
@@ -304,6 +309,14 @@ impl Snapshot {
         self.validators.iter().position(|&v| v == validator)
     }
 
+    /// Returns true if `block_number` is the last block of the current turn window.
+    /// When turn_length is 1 (pre-Bohr), every block is considered last in turn.
+    pub fn last_block_in_one_turn(&self, block_number: u64) -> bool {
+        let tl = u64::from(self.turn_length.unwrap_or(DEFAULT_TURN_LENGTH));
+        if tl <= 1 { return true; }
+        block_number % tl == tl - 1
+    }
+
     /// Count how many times each validator has signed in the recent window.
     pub fn count_recent_proposers(&self) -> HashMap<Address, u8> {
         let left_bound = if self.block_number > self.miner_history_check_len() {
@@ -328,7 +341,7 @@ impl Snapshot {
         if let Some(&times) = counts.get(&validator) {
             let allowed = u64::from(self.turn_length.unwrap_or(1));
             if u64::from(times) >= allowed { 
-                tracing::warn!("Recently signed, validator: {:?}, block_number: {:?}, times: {:?}, allowed: {:?}", validator, self.block_number, times, allowed);
+                tracing::debug!("Recently signed, validator: {:?}, block_number: {:?}, times: {:?}, allowed: {:?}", validator, self.block_number, times, allowed);
                 return true;
             }
         }
@@ -376,7 +389,7 @@ mod tests {
     fn sign_recently_detects_over_propose() {
         // three validators
         let validators = vec![addr(1), addr(2), addr(3)];
-        let mut snap = Snapshot::new(validators.clone(), 0, B256::ZERO, DEFAULT_EPOCH_LENGTH, None);
+        let mut snap = Snapshot::new(validators.clone(), 0, BlockHash::default(), DEFAULT_EPOCH_LENGTH, None);
 
         // simulate that validator 1 proposed previous block 0
         snap.recent_proposers.insert(1, addr(1));
@@ -391,7 +404,7 @@ mod tests {
     #[test]
     fn sign_recently_allows_within_limit() {
         let validators = vec![addr(1), addr(2), addr(3)];
-        let snap = Snapshot::new(validators, 0, B256::ZERO, DEFAULT_EPOCH_LENGTH, None);
+        let snap = Snapshot::new(validators, 0, BlockHash::default(), DEFAULT_EPOCH_LENGTH, None);
         // no recent entries, validator should be allowed
         assert!(!snap.sign_recently(addr(1)));
     }

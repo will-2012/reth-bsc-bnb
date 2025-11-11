@@ -6,7 +6,9 @@ pub const BSC_PROTOCOL_VERSION: u64 = 1;
 /// BSC protocol name
 pub const BSC_PROTOCOL_NAME: &str = "bsc";
 
-/// Number of message types supported (0x00, 0x01)
+/// Number of message types supported (strict parity subset)
+/// 0x00: Capability
+/// 0x01: Votes
 pub const BSC_MESSAGE_COUNT: u8 = 2;
 
 #[repr(u8)]
@@ -14,9 +16,6 @@ pub const BSC_MESSAGE_COUNT: u8 = 2;
 pub enum BscProtoMessageId {
     Capability = 0x00,
     Votes = 0x01,
-    // TODO: Add these back in when we have a use case for them
-    // GetBlocksByRange = 0x02,
-    // BlocksByRange = 0x03,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,11 +31,9 @@ impl BscProtoMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::BscProtoMessageId;
     use alloy_primitives::{hex, B256, FixedBytes};
     use alloy_rlp::{RlpEncodable, RlpDecodable};
     use crate::consensus::parlia::vote::{VoteData, VoteEnvelope};
-    use crate::node::network::votes::VotesPacket;
 
     /// Wrapper struct to match Go's RLP encoding of struct{Votes []*VoteEnvelope}
     #[derive(RlpEncodable, RlpDecodable)]
@@ -104,20 +101,5 @@ mod tests {
 
         let want = hex::decode(want_hex).unwrap();
         assert_eq!(encoded, want, "RLP-encoded votes packet must match reference");
-
-        // For VotesPacket, we expect just the inner votes array (not wrapped)
-        // since VotesPacket is a newtype around Vec<VoteEnvelope>
-        let votes_only = alloy_rlp::encode(&votes);
-        let with_msg_id = {
-            let mut v = Vec::with_capacity(1 + votes_only.len());
-            v.push(BscProtoMessageId::Votes as u8);
-            v.extend_from_slice(&votes_only);
-            v
-        };
-        let encoded_packet = alloy_rlp::encode(VotesPacket(votes));
-        assert_eq!(with_msg_id, encoded_packet);
     }
 }
-
-
-

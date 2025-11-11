@@ -1,6 +1,7 @@
 use reth::consensus::{HeaderValidator, ConsensusError, Consensus};
 use reth::primitives::SealedHeader;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, EthereumHardfork};
+use crate::consensus::parlia::util::calculate_millisecond_timestamp;
 use crate::hardforks::BscHardforks;
 use super::Parlia;
 use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH};
@@ -40,7 +41,6 @@ pub fn validate_header_base_fee<ChainSpec: EthereumHardforks>(
 pub fn validate_4844_header_of_bsc(header: &SealedHeader) -> Result<(), ConsensusError> {
     let blob_gas_used = header.blob_gas_used.ok_or(ConsensusError::BlobGasUsedMissing)?;
     let excess_blob_gas = header.excess_blob_gas.ok_or(ConsensusError::ExcessBlobGasMissing)?;
-
     if blob_gas_used > MAX_DATA_GAS_PER_BLOCK_DENCUN {
         return Err(ConsensusError::BlobGasUsedExceedsMaxBlobGasPerBlock {
             blob_gas_used,
@@ -70,10 +70,11 @@ pub fn validate_4844_header_of_bsc(header: &SealedHeader) -> Result<(), Consensu
 impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
         // Don't waste time checking blocks from the future
-        let present_timestamp = self.present_timestamp();
-        if header.timestamp > present_timestamp {
+        let present_timestamp = self.present_millis_timestamp();
+        let header_timestamp = calculate_millisecond_timestamp(header);
+        if header_timestamp > present_timestamp {
             return Err(ConsensusError::TimestampIsInFuture {
-               timestamp: header.timestamp,
+               timestamp: header_timestamp,
                present_timestamp,
             });
         }
@@ -92,8 +93,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_header_base_fee(header, &self.spec)?;
 
         // Ensures that EIP-4844 fields are valid once cancun is active.
-        if self.spec.is_london_active_at_block(header.number) && 
-            self.spec.is_cancun_active_at_timestamp(header.timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, header.number, header.timestamp) {
             validate_4844_header_of_bsc(header)?;
         } else if header.blob_gas_used.is_some() {
             return Err(ConsensusError::BlobGasUsedUnexpected)
@@ -147,7 +147,7 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         }
 
         // EIP-4844: Shard Blob Transactions
-        if self.spec.is_cancun_active_at_timestamp(block.timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
             // Check that the blob gas used in the header matches the sum of the blob gas used by
             // each blob tx
             let header_blob_gas_used =

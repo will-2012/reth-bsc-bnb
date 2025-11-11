@@ -1,12 +1,8 @@
 #![allow(clippy::owned_cow)]
 use crate::{
-    node::{
-        engine_api::payload::BscPayloadTypes,
-        network::block_import::{handle::ImportHandle, BscBlockImport},
-        primitives::{BscBlobTransactionSidecar, BscPrimitives},
-        BscNode,
-    },
-    BscBlock,
+    BscBlock, node::{
+        BscNode, engine_api::payload::BscPayloadTypes, network::{block_import::{BscBlockImport, handle::ImportHandle}, evn_peers::peer_id_to_node_id}, primitives::{BscBlobTransactionSidecar, BscPrimitives}
+    }
 };
 use alloy_rlp::{Decodable, Encodable};
 use handshake::BscHandshake;
@@ -22,13 +18,16 @@ use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::PeersInfo;
+use reth_provider::{BlockNumReader, HeaderProvider};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::info;
+use tracing::{info, warn, debug};
 
 pub mod block_import;
 pub mod bootnodes;
 pub mod handshake;
+pub mod evn;
+pub mod evn_peers;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
 pub(crate) mod bsc_protocol {
@@ -37,6 +36,7 @@ pub(crate) mod bsc_protocol {
         pub mod proto;
     }
     pub mod stream;
+    pub mod registry;
 }
 /// BSC `NewBlock` message value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +181,20 @@ impl BscNetworkBuilder {
     {
         let Self { engine_handle_rx } = self;
 
+        // Check if CLI bootnodes are provided and set bootnode override
+        if let Some(cli_bootnodes) = ctx.config().network.resolved_bootnodes() {
+            use crate::chainspec::bootnode_override;
+            if let Err(e) = bootnode_override::set_bootnode_override(Some(cli_bootnodes)) {
+                warn!(target: "bsc", "Failed to set bootnode override: {}", e);
+            }
+        } else {
+            // No CLI bootnodes provided, disable override
+            use crate::chainspec::bootnode_override;
+            if let Err(e) = bootnode_override::set_bootnode_override(None) {
+                warn!(target: "bsc", "Failed to disable bootnode override: {}", e);
+            }
+        }
+
         let network_builder = ctx.network_config_builder()?;
         let mut discv4 = Discv4Config::builder();
 
@@ -192,14 +206,20 @@ impl BscNetworkBuilder {
         let (to_import, from_network) = mpsc::unbounded_channel();
         let (to_network, import_outcome) = mpsc::unbounded_channel();
 
-        let handle = ImportHandle::new(to_import, import_outcome);
+        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let handle = ImportHandle::new(to_import.clone(), to_hashes, import_outcome);
+
+        // Expose the sender globally so that the miner can submit newly mined blocks
+        if crate::shared::set_block_import_sender(to_import.clone()).is_err() {
+            warn!(target: "bsc", "Block import sender already initialised; overriding skipped");
+        }
         
-        // Import the necessary types for consensus
-        use crate::consensus::ParliaConsensus;
+        // Import the necessary types for block import service
         use crate::node::network::block_import::service::ImportService;
         
-        // Create consensus instance for ImportService
-        let consensus = Arc::new(ParliaConsensus { provider: ctx.provider().clone() });
+        // Clone needed values before moving into the async closure
+        let provider = ctx.provider().clone();
+        let chain_spec = ctx.chain_spec().clone();
         
         // Spawn the critical ImportService task exactly like the official implementation
         ctx.task_executor().spawn_critical("block import", async move {
@@ -211,9 +231,17 @@ impl BscNetworkBuilder {
                 .await
                 .unwrap();
 
-            ImportService::new(consensus, handle, from_network, to_network).await.unwrap();
+            ImportService::new(
+                provider,
+                chain_spec,
+                handle,
+                from_network,
+                from_hashes,
+                to_network,
+            ).await.unwrap();
         });
 
+        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
         let network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
@@ -223,9 +251,23 @@ impl BscNetworkBuilder {
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandler);
         
+        let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
-        // Ensure our advertised fork ID matches the fork filter we validate against.
         network_config.status.forkid = network_config.fork_filter.current();
+        let provider = ctx.provider();
+        if let Ok(number) = provider.best_block_number() {
+            let td = provider.header_td_by_number(number).unwrap_or_default();
+            network_config.status.total_difficulty = td;
+        }
+        debug!(
+            target: "bsc::net",
+            peer_id = ?peer_id_to_node_id(peer_id),
+            version = ?network_config.status.version,
+            td = ?network_config.status.total_difficulty,
+            blockhash = ?network_config.status.blockhash,
+            genesis = ?network_config.status.genesis,
+            "Initialized BSC network configuration"
+        );
 
         Ok(network_config)
     }
@@ -253,7 +295,130 @@ where
         let network = NetworkManager::builder(network_config).await?;
         let handle = ctx.start_network(network, pool);
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
+        
+        let local_peer_id = handle.peer_id();
+        if crate::shared::set_local_peer_id(*local_peer_id).is_err() {
+            warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
+        } else {
+            info!(target: "reth::cli", peer_id=%local_peer_id, "Local peer ID set globally");
+        }
+
+        if let Err(_h) = crate::shared::set_network_handle(handle.clone()) {
+            warn!(target: "bsc::evn", "Network handle already initialised; overriding skipped");
+        }
+
+        if crate::node::network::evn::is_evn_enabled() {
+            spawn_evn_sync_watcher(ctx, handle.clone());
+        }
 
         Ok(handle)
     }
+}
+
+fn spawn_evn_sync_watcher<Node>(ctx: &BuilderContext<Node>, net: NetworkHandle<BscNetworkPrimitives>)
+where
+    Node: FullNodeTypes<Types = BscNode>,
+{
+    use reth_provider::StateProviderFactory;
+    let max_lag = std::env::var("BSC_EVN_SYNC_LAG_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    let provider = ctx.provider().clone();
+    let chain_spec = ctx.chain_spec().clone();
+    ctx.task_executor().spawn_critical("evn-sync-watcher", async move {
+        use std::time::{SystemTime, UNIX_EPOCH, Duration};
+        use alloy_consensus::BlockHeader;
+        use alloy_primitives::U256;
+        use reth_primitives::TransactionSigned;
+        use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
+
+        loop {
+            if crate::node::network::evn::is_evn_synced() { break; }
+            if let Some(n) = crate::shared::get_best_canonical_block_number() {
+                if let Some(h) = crate::shared::get_canonical_header_by_number(n) {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+                    let ts = h.timestamp();
+                    if now >= ts && now.saturating_sub(ts) <= max_lag {
+                        crate::node::network::evn::set_evn_synced(true);
+                        info!(target: "bsc::evn", head=%n, head_ts=%ts, lag = now - ts, "EVN armed: node considered synced");
+                        if let Some((to_add, to_remove)) = crate::node::network::evn::take_nodeids_actions_once() {
+                            if let Some(cfg) = crate::node::miner::config::get_global_mining_config() {
+                                if cfg.is_mining_enabled() {
+                                    if let Some(validator) = cfg.validator_address {
+                                        let mut waited = 0u64;
+                                        while !is_signer_initialized() && waited < 100 {
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            waited += 1;
+                                        }
+
+                                        if is_signer_initialized() {
+                                            if let Ok(state) = provider.state_by_block_hash(h.hash_slow()) {
+                                                if let Ok(Some(acc)) = state.basic_account(&validator) {
+                                                    let mut next_nonce = acc.nonce;
+                                                    let chain_id = chain_spec.chain().id();
+
+                                                    let mut signed_batch: Vec<TransactionSigned> = Vec::new();
+
+                                                    if !to_add.is_empty() {
+                                                        let (_to, data) = crate::system_contracts::encode_add_node_ids_call(to_add.clone());
+                                                        let tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                                                            chain_id: Some(chain_id),
+                                                            nonce: next_nonce,
+                                                            gas_limit: u64::MAX / 2,
+                                                            gas_price: 0,
+                                                            value: U256::ZERO,
+                                                            input: data,
+                                                            to: alloy_primitives::TxKind::Call(crate::system_contracts::STAKE_HUB_CONTRACT),
+                                                        });
+                                                        if let Ok(signed) = sign_system_transaction(tx) {
+                                                            next_nonce += 1;
+                                                            signed_batch.push(signed);
+                                                            info!(target: "bsc::evn", count = to_add.len(), "Prepared StakeHub.addNodeIDs for broadcast");
+                                                        }
+                                                    }
+
+                                                    if !to_remove.is_empty() {
+                                                        let (_to, data) = crate::system_contracts::encode_remove_node_ids_call(to_remove.clone());
+                                                        let tx = reth_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                                                            chain_id: Some(chain_id),
+                                                            nonce: next_nonce,
+                                                            gas_limit: u64::MAX / 2,
+                                                            gas_price: 0,
+                                                            value: U256::ZERO,
+                                                            input: data,
+                                                            to: alloy_primitives::TxKind::Call(crate::system_contracts::STAKE_HUB_CONTRACT),
+                                                        });
+                                                        if let Ok(signed) = sign_system_transaction(tx) {
+                                                            signed_batch.push(signed);
+                                                            info!(target: "bsc::evn", count = to_remove.len(), "Prepared StakeHub.removeNodeIDs for broadcast");
+                                                        }
+                                                    }
+
+                                                    if !signed_batch.is_empty() {
+                                                        if let Some(txh) = net.transactions_handle().await {
+                                                            let count = signed_batch.len();
+                                                            txh.broadcast_transactions(signed_batch);
+                                                            info!(target: "bsc::evn", n = count, "Broadcasted StakeHub NodeIDs system txs to public network");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            info!(target: "bsc::evn", "Skipping NodeIDs broadcast: miner signer not initialised");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        break;
+                    } else {
+                        debug!(target: "bsc::evn", head=%n, head_ts=%ts, lag = now.saturating_sub(ts), max_lag=%max_lag, "EVN not armed yet: syncing");
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 }

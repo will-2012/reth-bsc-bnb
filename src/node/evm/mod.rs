@@ -18,16 +18,18 @@ use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
         result::{EVMError, HaltReason, ResultAndState},
-        BlockEnv,
+        BlockEnv, ContextTr,
     },
+    context_interface::JournalTr,
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
 
 mod assembler;
+mod builder;
 pub mod config;
 pub use config::BscEvmConfig;
 mod executor;
-mod pre_execution;
+pub mod pre_execution;
 mod post_execution;
 mod factory;
 mod patch;
@@ -55,33 +57,57 @@ where
 
     fn transact_raw(
         &mut self,
-        tx: Self::Tx,
+        mut tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        if self.inspect {
+        // Detect system transactions in inspect mode (for trace APIs)
+        // Normal execution: BlockExecutor filters system txs before calling transact
+        // debug_traceTransaction/debug_traceCall: detect and handle system txs here
+
+        if !tx.is_system_transaction {
+            use crate::system_contracts::is_invoke_system_contract;
+            use revm::primitives::TxKind;
+
+            tx.is_system_transaction = matches!(tx.base.kind, TxKind::Call(to)
+                if tx.base.caller == self.block.beneficiary
+                    && is_invoke_system_contract(&to)
+                    && tx.base.gas_price == 0);
+            
+            // Increase beneficiary balance for system transactions
+            if self.inspect && tx.is_system_transaction {
+                let beneficiary = self.block.beneficiary;
+                if let Ok(account) = self.journal_mut().load_account(beneficiary) {
+                    account.data.info.balance = tx.base.value;
+                    account.data.mark_touch();
+                }
+            }
+        }
+
+        // Save original environment for system transactions
+        let saved_env = if tx.is_system_transaction {
+            Some((
+                core::mem::replace(&mut self.block.gas_limit, tx.base.gas_limit),
+                core::mem::replace(&mut self.block.basefee, 0),
+                core::mem::replace(&mut self.cfg.disable_nonce_check, true),
+            ))
+        } else {
+            None
+        };
+
+        // Execute transaction
+        let res = if self.inspect {
             self.inspect_tx(tx)
-        } else if tx.is_system_transaction {
-            let mut gas_limit = tx.base.gas_limit;
-            let mut basefee = 0;
-            let mut disable_nonce_check = true;
-
-            // ensure the block gas limit is >= the tx
-            core::mem::swap(&mut self.block.gas_limit, &mut gas_limit);
-            // disable the base fee check for this call by setting the base fee to zero
-            core::mem::swap(&mut self.block.basefee, &mut basefee);
-            // disable the nonce check
-            core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
-            let res = ExecuteEvm::transact(self, tx);
-
-            // swap back to the previous gas limit
-            core::mem::swap(&mut self.block.gas_limit, &mut gas_limit);
-            // swap back to the previous base fee
-            core::mem::swap(&mut self.block.basefee, &mut basefee);
-            // swap back to the previous nonce check flag
-            core::mem::swap(&mut self.cfg.disable_nonce_check, &mut disable_nonce_check);
-            res
         } else {
             ExecuteEvm::transact(self, tx)
+        };
+
+        // Restore environment for system transactions
+        if let Some((gas_limit, basefee, disable_nonce_check)) = saved_env {
+            self.block.gas_limit = gas_limit;
+            self.block.basefee = basefee;
+            self.cfg.disable_nonce_check = disable_nonce_check;
         }
+
+        res
     }
 
     fn transact_system_call(

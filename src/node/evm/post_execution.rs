@@ -1,10 +1,14 @@
 use super::executor::BscBlockExecutor;
-use super::error::BscBlockExecutionError;
+use super::error::{BscBlockExecutionError, BscBlockValidationError};
 use super::util::set_nonce;
+use crate::consensus::parlia::FF_REWARD_DISTRIBUTION_INTERVAL;
+use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
+use crate::node::evm::util::get_header_by_hash_from_cache;
+use crate::node::miner::signer::{sign_system_transaction, is_signer_initialized};
 use crate::consensus::parlia::{DIFF_INTURN, VoteAddress, VoteAttestation, snapshot::DEFAULT_TURN_LENGTH, constants::COLLECT_ADDITIONAL_VOTES_REWARD_RATIO, util::is_breathe_block};
 use crate::consensus::{SYSTEM_ADDRESS, MAX_SYSTEM_REWARD, SYSTEM_REWARD_PERCENT};
 use crate::evm::transaction::BscTxEnv;
-use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
+use crate::system_contracts::{SLASH_CONTRACT, SYSTEM_REWARD_CONTRACT, STAKE_HUB_CONTRACT, feynman_fork::{ValidatorElectionInfo, get_top_validators_by_voting_power, ElectedValidators}};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx}, execute::BlockExecutionError, Database, Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, block::StateChangeSource};
 use reth_primitives::{TransactionSigned, Transaction};
@@ -15,7 +19,7 @@ use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, Signab
 use alloy_primitives::{Address, hex, TxKind, U256};
 use std::collections::HashMap;
 use tracing::warn;
-use reth_primitives_traits::GotExpected;
+use reth_primitives_traits::{GotExpected, SignerRecoverable};
 use bit_set::BitSet;
 
 
@@ -35,17 +39,17 @@ where
     BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
     R::Transaction: Into<TransactionSigned>,
 {
-    /// finalize the new block, post check and finalize the system tx.
+    /// post check the new block, post check some parlia field and the system txs.
     /// depends on parlia, header and snapshot.
-    pub(crate) fn finalize_new_block(
+    pub(crate) fn post_check_new_block(
         &mut self, 
         block: &BlockEnv
     ) -> Result<(), BlockExecutionError> {
-        tracing::trace!("Start to finalize new block, block_number: {}", block.number); 
+        tracing::debug!("Start to post check new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner); 
         self.verify_validators(self.inner_ctx.current_validators.clone(), self.inner_ctx.header.clone())?;
         self.verify_turn_length(self.inner_ctx.header.clone())?;
 
-        // finalize the system txs.
+        // check the system txs.
         if self.inner_ctx.header.as_ref().unwrap().difficulty != DIFF_INTURN {
             tracing::debug!("Start to slash spoiled validator, block_number: {}, block_difficulty: {:?}, diff_inturn: {:?}", 
                 block.number, self.inner_ctx.header.as_ref().unwrap().difficulty, DIFF_INTURN);
@@ -58,23 +62,32 @@ where
             };
             if !signed_recently {
                 self.slash_spoiled_validator(block.beneficiary, spoiled_validator)?;
-                tracing::debug!("Slash spoiled validator, block_number: {}, spoiled_validator: {}", block.number, spoiled_validator);
+                let block_hash = self.inner_ctx.header.as_ref().map(|h| h.hash_slow());
+                tracing::info!(
+                    target: "bsc::evm",
+                    block_number = %block.number,
+                    block_hash = ?block_hash,
+                    spoiled_validator = ?spoiled_validator,
+                    backoff_validator = ?block.beneficiary,
+                    "Slash spoiled validator"
+                );
             }
         }
 
         self.distribute_incoming(block.beneficiary)?;
 
         if self.spec.is_plato_active_at_block(block.number.to()) {
-            let header = self.inner_ctx.header.as_ref().unwrap().clone();
-            self.distribute_finality_reward(&header)?;
+            self.distribute_finality_reward()?;
         }
 
         // update validator set after Feynman upgrade
-        let header = self.inner_ctx.header.as_ref().unwrap().clone();
+        let header_number = self.evm.block().number.to::<u64>();
+        let header_timestamp = self.evm.block().timestamp.to::<u64>();
+        let header_beneficiary = self.evm.block().beneficiary;
         let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
-        if self.spec.is_feynman_active_at_timestamp(header.number, header.timestamp) &&
-            is_breathe_block(parent_header.timestamp, header.timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header.timestamp, parent_header.timestamp)
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+            is_breathe_block(parent_header.timestamp, header_timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
         {
             let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
             let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
@@ -82,26 +95,59 @@ where
             self.update_validator_set_v2(
                  max_elected_validators,
                  validators_election_info.clone(),
-                 header.beneficiary,
+                 header_beneficiary,
              )?;
             tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
-                header.number, max_elected_validators, validators_election_info);
+                header_number, max_elected_validators, validators_election_info);
         }
 
         if !self.system_txs.is_empty() {
-            tracing::error!("Unexpected system tx, block_number: {}, len: {}", block.number, self.system_txs.len());
+            tracing::error!(
+                "Remaining system txs after block execution, block_number: {}, len: {}",
+                block.number,
+                self.system_txs.len()
+            );
             for tx in self.system_txs.iter() {
-                tracing::error!("system tx: {:?}", tx);
+                tracing::error!("remaining system tx: {:?}", tx);
             }
-            return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
+            return Err(BscBlockExecutionError::Validation(BscBlockValidationError::UnexpectedSystemTx).into());
         }
 
-        let epoch_length = self.parlia.get_epoch_length(&header);
-        if (header.number + 1).is_multiple_of(epoch_length) {
+        let header = self.inner_ctx.header.as_ref().unwrap().clone();
+        
+        // Notes: here we get the current block's snapshot (after applying this block's header) to prepare cache.
+        // This is important because epoch_num may change during block application
+        let current_snap = self
+            .snapshot_provider
+            .as_ref()
+            .unwrap()
+            .snapshot_by_hash(&header.hash_slow())
+            .ok_or(BlockExecutionError::msg("Failed to get current snapshot from snapshot provider"))?;
+        
+        // Use epoch_num from current snapshot (after apply) for epoch boundary check
+        let epoch_length = current_snap.epoch_num;
+        let is_next_epoch = (header.number + 1).is_multiple_of(epoch_length);
+        if is_next_epoch {  // cache validators
             // cache it on pre block.
-            self.get_current_validators(header.number)?;
+            // for verify validators in post-check of fullnode mode and prepare new header in miner mode.
+            self.get_current_validators(header.number, header.hash_slow())?;
         }
 
+        { // cache turnlength
+            let is_bohr = self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
+            tracing::debug!(
+                "Check turn length cache update: block_number={}, epoch_length={}, is_next_epoch={}, is_bohr={}",
+                header.number, epoch_length, is_next_epoch, is_bohr
+            );
+            
+            if is_next_epoch && is_bohr {
+                let turn_length = self.get_turn_length(&header)?;
+                let mut cache = TURN_LENGTH_CACHE.lock().unwrap();
+                cache.insert(header.hash_slow(), turn_length);
+                tracing::debug!("Succeed to update turn length cache, block_number: {}, block_hash: {}, epoch_length: {}, turn_length: {}", 
+                    header.number, header.hash_slow(), epoch_length, turn_length);
+            }
+        }
         tracing::trace!("Succeed to finalize new block, block_number: {}", block.number);
         Ok(())
     }
@@ -112,7 +158,7 @@ where
         header: Option<Header>
     ) -> Result<(), BlockExecutionError> {
         let header_ref = header.as_ref().unwrap();
-        let epoch_length = self.parlia.get_epoch_length(header_ref);
+        let epoch_length = self.inner_ctx.snap.as_ref().unwrap().epoch_num;
         if !header_ref.number.is_multiple_of(epoch_length) {
             tracing::trace!("Skip verify validator, block_number {} is not an epoch boundary, epoch_length: {}", header_ref.number, epoch_length);
             return Ok(());
@@ -168,10 +214,10 @@ where
             match self.parlia.get_turn_length_from_header(header_ref, epoch_length) {
                 Ok(Some(length)) => length,
                 Ok(None) => return Ok(()),
-                Err(err) => return Err(BscBlockExecutionError::ParliaConsensusInnerError { error: Box::new(err) }.into()),
+                Err(err) => return Err(BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: Box::new(err) }).into()),
             }
         };
-        let turn_length_from_contract = self.get_turn_length(header_ref)?.unwrap();
+        let turn_length_from_contract = self.get_turn_length(header_ref)?;
         if turn_length_from_header == turn_length_from_contract {
             tracing::debug!("Succeed to verify turn length, block_number: {}", header_ref.number);
             return Ok(())
@@ -179,22 +225,24 @@ where
 
         tracing::warn!("Failed to verify turn length, block_number: {}, turn_length_from_header: {}, turn_length_from_contract: {}, epoch_length: {}", 
             header_ref.number, turn_length_from_header, turn_length_from_contract, epoch_length);
-        Err(BscBlockExecutionError::MismatchingEpochTurnLengthError.into())
+        Err(BscBlockExecutionError::Validation(
+            BscBlockValidationError::MismatchingEpochTurnLengthError
+        ).into())
     }
 
     fn get_turn_length(
         &mut self,
         header: &Header,
-    ) -> Result<Option<u8>, BlockExecutionError> {
+    ) -> Result<u8, BlockExecutionError> {
         if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
             let (to, data) = self.system_contracts.get_turn_length();
             let bz = self.eth_call(to, data)?;
 
             let turn_length = self.system_contracts.unpack_data_into_turn_length(bz.as_ref()).to::<u8>();
-            return Ok(Some(turn_length))
+            return Ok(turn_length);
         }
 
-        Ok(Some(DEFAULT_TURN_LENGTH))
+        Ok(DEFAULT_TURN_LENGTH)
     }
 
     fn slash_spoiled_validator(
@@ -222,26 +270,66 @@ where
             .unwrap_or_default();
 
         let transaction = set_nonce(transaction, account.nonce);
-        let hash = transaction.signature_hash();
-        if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
-            // slash tx could fail and not in the block
-            if let Some(to) = transaction.to() {
-                if to == SLASH_CONTRACT &&
-                    (self.system_txs.is_empty() ||
-                        self.system_txs[0].to().unwrap_or_default() !=
-                            SLASH_CONTRACT)
-                {
-                    warn!("slash validator failed");
-                    return Ok(());
+
+        let signed_tx = if !self.ctx.is_miner {
+            let hash = transaction.signature_hash();
+            if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
+                // slash tx could fail and not in the block
+                if let Some(to) = transaction.to() {
+                    if to == SLASH_CONTRACT &&
+                        (self.system_txs.is_empty() ||
+                            self.system_txs[0].to().unwrap_or_default() !=
+                                SLASH_CONTRACT)
+                    {
+                        warn!("slash validator failed");
+                        return Ok(());
+                    }
+                }
+                warn!("unexpected transaction: {:?}", transaction);
+                for tx in self.system_txs.iter() {
+                    warn!("left system tx: {:?}", tx);
+                }
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::UnexpectedSystemTx
+                ).into());
+            }
+            Some(self.system_txs.remove(0))
+        } else if is_signer_initialized() {
+            match sign_system_transaction(transaction.clone()) {
+                Ok(signed) => Some(signed),
+                Err(e) => {
+                    tracing::warn!("Failed to sign system transaction: {}", e);
+                    return Err(BscBlockExecutionError::FailedToSignSystemTransaction { error: e.to_string() }.into());
                 }
             }
-            warn!("unexpected transaction: {:?}", transaction);
-            for tx in self.system_txs.iter() {
-                warn!("left system tx: {:?}", tx);
+        } else {
+            tracing::warn!("Global signer not initialized for mining mode");
+            return Err(BscBlockExecutionError::GlobalSignerNotInitializedForMiningMode.into());
+        };
+
+        if self.ctx.is_miner {
+            if let Some(signed) = signed_tx.clone() {
+                let recovered = signed.clone().try_into_recovered_unchecked().unwrap_or_else(|_| {
+                    panic!("Failed to recover system transaction signature")
+                });
+                self.assembled_system_txs.push(recovered);
+
+                if transaction.to() == Some(STAKE_HUB_CONTRACT) {
+                    if let Some(net) = crate::shared::get_network_handle() {
+                        let tx_to_broadcast = signed.clone();
+                        tokio::spawn(async move {
+                            if let Some(txh) = net.transactions_handle().await {
+                                txh.broadcast_transactions(std::iter::once(tx_to_broadcast));
+                                tracing::info!(
+                                    target: "bsc::evn",
+                                    "Broadcasted StakeHub system tx to public network"
+                                );
+                            }
+                        });
+                    }
+                }
             }
-            return Err(BscBlockExecutionError::UnexpectedSystemTx.into());
         }
-        let signed_tx = self.system_txs.remove(0);
 
         // Create TxEnv first (before moving transaction)
         let tx_env = BscTxEnv {
@@ -272,8 +360,9 @@ where
 
         let gas_used = result.gas_used();
         self.gas_used += gas_used;
+
         self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
-            tx: &signed_tx,
+            tx: signed_tx.as_ref().unwrap(),
             evm: &self.evm,
             result,
             state: &state,
@@ -325,6 +414,7 @@ where
         {
             let reward_to_system = block_reward >> SYSTEM_REWARD_PERCENT;
             if reward_to_system > 0 {
+                // send reward to SYSTEM_REWARD_CONTRACT from miner.
                 let tx = self.system_contracts.distribute_to_system(reward_to_system);
                 self.transact_system_tx(tx, validator)?;
                 tracing::debug!("Distribute to system, block_number: {}, reward_to_system: {}", self.evm.block().number, reward_to_system);
@@ -333,6 +423,7 @@ where
             block_reward -= reward_to_system;
         }
 
+        // send all left gas fees to VALIDATOR_CONTRACT for distributing & burning.
         let tx = self.system_contracts.distribute_to_validator(validator, block_reward);
         self.transact_system_tx(tx, validator)?;
         tracing::debug!("Distribute to validator, block_number: {}, block_reward: {}", self.evm.block().number, block_reward);
@@ -342,41 +433,39 @@ where
 
     fn distribute_finality_reward(
         &mut self,
-        header: &Header
     ) -> Result<(), BlockExecutionError> {
-        // distribute finality reward per 200 blocks.
-        let distribute_interval = 200;
-        if !header.number.is_multiple_of(distribute_interval) {
+        // distribute finality reward per FF_REWARD_DISTRIBUTION_INTERVAL blocks.
+        let block_number = self.evm.block().number.to::<u64>();
+        if !block_number.is_multiple_of(FF_REWARD_DISTRIBUTION_INTERVAL) {
             return Ok(());
         }
 
-        let validator = header.beneficiary;
+        let validator = self.evm.block().beneficiary;
         let mut accumulated_weights: HashMap<Address, U256> = HashMap::new();
 
-        let start = (header.number - distribute_interval).max(1);
-        let end = header.number;
-        let mut target_number = header.number - 1;
+        let start = (block_number - FF_REWARD_DISTRIBUTION_INTERVAL).max(1);
+        let end = block_number;
+
+        // query block header and snapshot by hash from cache.
+        let mut target_hash = self.ctx.base.parent_hash;
         for _ in (start..end).rev() {
-            let header = self.snapshot_provider.
-                as_ref().
-                unwrap().
-                get_header(target_number)
-                .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {target_number}")))?;
+            let header = get_header_by_hash_from_cache(&target_hash).
+                ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}")))?;
             let snap = self.snapshot_provider.
                 as_ref().
                 unwrap().
-                snapshot(target_number).
+                snapshot_by_hash(&header.hash_slow()).
                 ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
 
             if let Some(attestation) =
                 self.parlia.get_vote_attestation_from_header(&header, snap.epoch_num).map_err(|err| {
                     tracing::error!("Failed to distribute finality reward due to can not get vote attestation from header, block_number: {}, error: {:?}", header.number, err);
-                    BscBlockExecutionError::ParliaConsensusInnerError { error: err.into() }
+                    BscBlockExecutionError::Validation(BscBlockValidationError::ParliaConsensusError { error: err.into() })
                 })?
             {
                 self.process_attestation(&attestation, &header, &mut accumulated_weights)?;
             }
-            target_number = header.number - 1;
+            target_hash = header.parent_hash;
         }
 
         let mut validators: Vec<Address> = accumulated_weights.keys().copied().collect();
@@ -398,11 +487,11 @@ where
         parent_header: &Header,
         accumulated_weights: &mut std::collections::HashMap<Address, U256>,
     ) -> Result<(), BlockExecutionError> {
-        let justified_header = self.snapshot_provider.as_ref().unwrap().get_header(attestation.data.target_number)
-            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {}", attestation.data.target_number)))?;
-        let parent = self.snapshot_provider.as_ref().unwrap().get_header(justified_header.number - 1)
-            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found for block number: {}", justified_header.number - 1)))?;
-        let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot(parent.number);
+        let justified_header = get_header_by_hash_from_cache(&attestation.data.target_hash)
+            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", attestation.data.target_hash)))?;
+        let parent = get_header_by_hash_from_cache(&justified_header.parent_hash)
+            .ok_or_else(|| BlockExecutionError::msg(format!("Header not found, block_hash: {}", justified_header.parent_hash)))?;
+        let snapshot = self.snapshot_provider.as_ref().unwrap().snapshot_by_hash(&parent.hash_slow());
         let validators = &snapshot.unwrap().validators;  
         let mut validators_bit_set = BitSet::new();
         let vote_address_set = attestation.vote_address_set;
@@ -413,11 +502,12 @@ where
         }
 
         if validators_bit_set.len() > validators.len() {
-            return Err(BscBlockExecutionError::InvalidAttestationVoteCount(GotExpected {
-                got: validators_bit_set.len() as u64,
-                expected: validators.len() as u64,
-            })
-            .into());
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::InvalidAttestationVoteCount(GotExpected {
+                    got: validators_bit_set.len() as u64,
+                    expected: validators.len() as u64,
+                })
+            ).into());
         }
 
         let mut valid_vote_count = 0;
@@ -453,6 +543,68 @@ where
             self.system_contracts.update_validator_set_v2(validators, voting_powers, vote_addrs),
             validator,
         )?;
+
+        Ok(())
+    }
+
+    /// generate system txs and apply them, used by miner.
+    pub(crate) fn finalize_new_block(
+        &mut self, 
+        block: &BlockEnv
+    ) -> Result<(), BlockExecutionError> {
+        tracing::debug!("Start to finalize new block, block_number: {}, is_miner: {}", block.number, self.ctx.is_miner);
+        let snap = self.inner_ctx.snap.as_ref().unwrap();
+        let expected_validator = snap.inturn_validator();
+        if block.beneficiary != expected_validator {
+            let signed_recently = if self.spec.is_plato_active_at_block(block.number.to()) {
+                snap.sign_recently(expected_validator)
+            } else {
+                snap.recent_proposers.iter().any(|(_, v)| *v == expected_validator)
+            };
+            if !signed_recently {
+                // Note: If this is a backoff (offturn) validator trying to slash the inturn validator,
+                // this block may not become part of the canonical chain. The inturn validator's block
+                // has higher difficulty (DIFF_INTURN=2) and will be preferred by fork choice rules.
+                // This slash attempt will only succeed if the inturn validator truly failed to produce a block.
+                self.slash_spoiled_validator(block.beneficiary, expected_validator)?;
+                let block_hash = self.inner_ctx.header.as_ref().map(|h| h.hash_slow());
+                tracing::trace!(
+                    target: "bsc::evm",
+                    block_number = %block.number,
+                    block_hash = ?block_hash,
+                    spoiled_validator = ?expected_validator,
+                    backoff_validator = ?block.beneficiary,
+                    "Try slash spoiled validator by miner"
+                );
+            }
+        }
+
+        self.distribute_incoming(block.beneficiary)?;
+
+        if self.spec.is_plato_active_at_block(block.number.to()) {
+            self.distribute_finality_reward()?;
+        }
+
+        // update validator set after Feynman upgrade
+        let header_number = self.evm.block().number.to::<u64>();
+        let header_timestamp = self.evm.block().timestamp.to::<u64>();
+        let header_beneficiary = self.evm.block().beneficiary;
+        let parent_header = self.inner_ctx.parent_header.as_ref().unwrap().clone();
+        if self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
+            is_breathe_block(parent_header.timestamp, header_timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp)
+        {
+            let max_elected_validators = self.inner_ctx.max_elected_validators.unwrap_or(U256::from(21));
+            let validators_election_info = self.inner_ctx.validators_election_info.clone().unwrap_or_default();
+ 
+            self.update_validator_set_v2(
+                 max_elected_validators,
+                 validators_election_info.clone(),
+                 header_beneficiary,
+             )?;
+            tracing::debug!("Update validator set, block_number: {}, max_elected_validators: {}, validators_election_info: {:?}", 
+                header_number, max_elected_validators, validators_election_info);
+        }
 
         Ok(())
     }

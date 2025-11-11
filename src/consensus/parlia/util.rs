@@ -5,6 +5,9 @@ use alloy_rlp::Encodable;
 use bytes::BufMut;
 use std::env;
 use super::constants::EXTRA_SEAL_LEN;
+use crate::consensus::parlia::Snapshot;
+use alloy_primitives::Address;
+use crate::consensus::parlia::{DIFF_NOTURN, DIFF_INTURN};
 
 const SECONDS_PER_DAY: u64 = 86400; // 24 * 60 * 60
 
@@ -19,6 +22,42 @@ pub fn is_same_day_in_utc(first: u64, second: u64) -> bool {
 
 pub fn is_breathe_block(last_block_time: u64, block_time: u64) -> bool {
     last_block_time != 0 && !is_same_day_in_utc(last_block_time, block_time)
+}
+
+/// Print all header fields that participate for debug.
+pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
+    let block_id = format!("#{}-0x{:x}", header.number, alloy_primitives::keccak256(header.parent_hash.as_slice()));
+    let signed_extra_data = &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
+    
+    tracing::debug!(
+        target: "bsc::parlia::util",
+        context = context,
+        block_id = %block_id,
+        chain_id = chain_id,
+        parent_hash = %format!("0x{:x}", header.parent_hash),
+        ommers_hash = %format!("0x{:x}", header.ommers_hash),
+        beneficiary = %format!("0x{:x}", header.beneficiary),
+        state_root = %format!("0x{:x}", header.state_root),
+        transactions_root = %format!("0x{:x}", header.transactions_root),
+        receipts_root = %format!("0x{:x}", header.receipts_root),
+        logs_bloom = %format!("0x{}", alloy_primitives::hex::encode(header.logs_bloom)),
+        difficulty = %header.difficulty.to_string(),
+        number = header.number,
+        gas_limit = header.gas_limit,
+        gas_used = header.gas_used,
+        timestamp = header.timestamp,
+        extra_data_len = header.extra_data.len(),
+        signed_extra_data_len = signed_extra_data.len(),
+        signed_extra_data = %format!("0x{}", alloy_primitives::hex::encode(signed_extra_data)),
+        mix_hash = %format!("0x{:x}", header.mix_hash),
+        nonce = %header.nonce.to_string(),
+        base_fee_per_gas = ?header.base_fee_per_gas,
+        withdrawals_root = ?header.withdrawals_root.map(|h| format!("0x{:x}", h)),
+        blob_gas_used = ?header.blob_gas_used,
+        excess_blob_gas = ?header.excess_blob_gas,
+        parent_beacon_block_root = ?header.parent_beacon_block_root.map(|h| format!("0x{:x}", h)),
+        requests_hash = ?header.requests_hash.map(|h| format!("0x{:x}", h)),
+    );
 }
 
 pub fn hash_with_chain_id(header: &Header, chain_id: u64) -> B256 {
@@ -117,6 +156,20 @@ pub fn calculate_millisecond_timestamp(header: &Header) -> u64 {
     };
 
     seconds * 1000 + ms_part
+}
+
+pub fn set_millisecond_part_of_timestamp(timestamp_ms: u64, header: &mut Header) {
+    let milliseconds_part = timestamp_ms % 1000;
+    let mut mix_hash_bytes = [0u8; 32];
+    mix_hash_bytes[24..32].copy_from_slice(&milliseconds_part.to_be_bytes());
+    header.mix_hash = B256::new(mix_hash_bytes);
+}
+
+pub fn calculate_difficulty(snap: &Snapshot, signer: Address) -> U256 {
+    if snap.is_inturn(signer) {
+        return DIFF_INTURN
+    }
+    DIFF_NOTURN
 }
 
 #[cfg(test)]

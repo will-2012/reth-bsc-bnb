@@ -44,7 +44,7 @@ impl Decodable for BscCapPacket {
         if message_id != (BscProtoMessageId::Capability as u8) {
             return Err(alloy_rlp::Error::Custom("Invalid message ID for BscCapPacket"));
         }
-        
+
         // Decode RLP list: [protocol_version, extra]
         let header = alloy_rlp::Header::decode(buf)?;
         if !header.list {
@@ -60,7 +60,7 @@ impl Decodable for BscCapPacket {
         }
         let extra = Bytes::copy_from_slice(&buf[..remaining_len]);
         *buf = &buf[remaining_len..];
-        
+
         Ok(Self { protocol_version, extra })
     }
 }
@@ -75,9 +75,9 @@ struct VotesWrapper(Vec<VoteEnvelope>);
 
 impl Encodable for VotesPacket {
     fn encode(&self, out: &mut dyn BufMut) {
-        // Message ID is a raw byte followed by bare []VoteEnvelope
+        // Message ID is a raw byte followed by Go-style wrapper: struct{Votes []*VoteEnvelope}
         out.put_u8(BscProtoMessageId::Votes as u8);
-        self.0.encode(out);
+        VotesWrapper(self.0.clone()).encode(out);
     }
 }
 
@@ -93,14 +93,7 @@ impl Decodable for VotesPacket {
             return Err(alloy_rlp::Error::Custom("Invalid message ID for VotesPacket"));
         }
 
-        // First, try the bare []VoteEnvelope encoding (what we emit)
-        let mut inner = *buf;
-        if let Ok(votes) = Vec::<VoteEnvelope>::decode(&mut inner) {
-            *buf = inner;
-            return Ok(Self(votes));
-        }
-
-        // Fallback: accept Go-style wrapper: struct{Votes []*VoteEnvelope}
+        // Go-style wrapper: struct{Votes []*VoteEnvelope}
         let mut inner = *buf;
         if let Ok(VotesWrapper(votes)) = VotesWrapper::decode(&mut inner) {
             *buf = inner;
@@ -116,6 +109,7 @@ impl Decodable for VotesPacket {
 /// mirroring Geth's logic.
 pub fn handle_votes_broadcast(packet: VotesPacket) {
     if let Some(first) = packet.0.into_iter().next() {
+        tracing::debug!(target: "bsc::vote", "insert first vote into local pool, target_number: {}, target_hash: {}", first.data.target_number, first.data.target_hash);
         votes::put_vote(first);
     }
 }

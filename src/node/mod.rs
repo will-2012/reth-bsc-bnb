@@ -1,15 +1,11 @@
 use crate::{
-    chainspec::BscChainSpec,
-    node::{
+    BscBlock, BscBlockBody, chainspec::BscChainSpec, node::{
         engine_api::{
             builder::BscEngineApiBuilder,
             payload::BscPayloadTypes,
             validator::{BscEngineValidatorBuilder, BscPayloadValidatorBuilder},
-        },
-        primitives::BscPrimitives,
-        storage::BscStorage,
-    },
-    BscBlock, BscBlockBody,
+        }, pool::BscPoolBuilder, primitives::BscPrimitives, storage::BscStorage
+    }
 };
 use consensus::BscConsensusBuilder;
 use engine::BscPayloadServiceBuilder;
@@ -21,7 +17,7 @@ use reth::{
 };
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_node_ethereum::{node::EthereumPoolBuilder, EthereumEthApiBuilder};
+use reth_node_ethereum::EthereumEthApiBuilder;
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use reth_primitives::BlockBody;
 use std::sync::Arc;
@@ -31,14 +27,18 @@ pub mod consensus;
 pub mod engine;
 pub mod engine_api;
 pub mod evm;
+pub mod pool;
+pub mod miner;
 pub mod network;
 pub mod primitives;
 pub mod storage;
+pub mod vote_producer;
+pub mod vote_journal;
 
 /// Bsc addons configuring RPC types
 pub type BscNodeAddOns<N> = RpcAddOns<
     N,
-    EthereumEthApiBuilder,
+    EthereumEthApiBuilder,  // Use standard Ethereum API builder
     BscPayloadValidatorBuilder,
     BscEngineApiBuilder,
     BscEngineValidatorBuilder,
@@ -71,7 +71,7 @@ impl BscNode {
         &self,
     ) -> ComponentsBuilder<
         Node,
-        EthereumPoolBuilder,
+        BscPoolBuilder,
         BscPayloadServiceBuilder,
         BscNetworkBuilder,
         BscExecutorBuilder,
@@ -82,7 +82,7 @@ impl BscNode {
     {
         ComponentsBuilder::default()
             .node_types::<Node>()
-            .pool(EthereumPoolBuilder::default())
+            .pool(BscPoolBuilder::default())
             .executor(BscExecutorBuilder::default())
             .payload(BscPayloadServiceBuilder::default())
             .network(BscNetworkBuilder::new(self.engine_handle_rx.clone()))
@@ -103,7 +103,7 @@ where
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
-        EthereumPoolBuilder,
+        BscPoolBuilder,
         BscPayloadServiceBuilder,
         BscNetworkBuilder,
         BscExecutorBuilder,

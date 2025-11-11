@@ -1,4 +1,9 @@
-use super::{assembler::BscBlockAssembler, executor::BscBlockExecutor, factory::BscEvmFactory};
+use super::{
+    assembler::BscBlockAssembler,
+    builder::BscBlockBuilder,
+    executor::BscBlockExecutor,
+    factory::BscEvmFactory,
+};
 use crate::{
     chainspec::BscChainSpec,
     evm::transaction::BscTxEnv,
@@ -15,8 +20,9 @@ use reth_ethereum_forks::EthereumHardfork;
 use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
-    ConfigureEngineEvm, ConfigureEvm, EvmEnv, EvmFactory, ExecutableTxIterator, ExecutionCtxFor,
-    FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, NextBlockEnvAttributes,
+    execute::BlockBuilder,
+    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmFactory, EvmFor, ExecutableTxIterator, ExecutionCtxFor,
+    FromRecoveredTx, FromTxWithEncoded, InspectorFor, IntoTxEnv, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives::{BlockTy, HeaderTy, SealedBlock, SealedHeader, TransactionSigned};
@@ -37,6 +43,8 @@ pub struct BscBlockExecutionCtx<'a> {
     pub base: EthBlockExecutionCtx<'a>,
     /// Block header (optional for BSC-specific logic).
     pub header: Option<Header>,
+    /// Whether the block is being mined.
+    pub is_miner: bool,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -123,7 +131,7 @@ impl<R, Spec, EvmFactory> BscBlockExecutorFactory<R, Spec, EvmFactory> {
 
 impl<R, Spec, EvmF> BlockExecutorFactory for BscBlockExecutorFactory<R, Spec, EvmF>
 where
-    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>>,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>> + Clone,
     Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone,
     EvmF: EvmFactory<Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>>,
     R::Transaction: From<TransactionSigned> + Clone,
@@ -139,11 +147,12 @@ where
         &self.evm_factory
     }
 
+    #[allow(refining_impl_trait)]
     fn create_executor<'a, DB, I>(
         &'a self,
         evm: <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> impl BlockExecutorFor<'a, Self, DB, I>
+    ) -> BscBlockExecutor<'a, <Self::EvmFactory as EvmFactory>::Evm<&'a mut State<DB>, I>, Spec, R>
     where
         DB: alloy_evm::Database + 'a,
         I: Inspector<<Self::EvmFactory as EvmFactory>::Context<&'a mut State<DB>>> + 'a,
@@ -152,7 +161,7 @@ where
             evm,
             ctx,
             self.spec().clone(),
-            self.receipt_builder(),
+            self.receipt_builder().clone(),
             SystemContract::new(self.spec().clone()),
         )
     }
@@ -168,19 +177,19 @@ where
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
     type BlockExecutorFactory = BscBlockExecutorFactory;
-    type BlockAssembler = Self;
+    type BlockAssembler = BscBlockAssembler<BscChainSpec>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.executor_factory
     }
 
     fn block_assembler(&self) -> &Self::BlockAssembler {
-        self
+        &self.block_assembler
     }
 
     fn evm_env(&self, header: &Header) -> EvmEnv<BscHardfork> {
         let mut blob_params = None;
-        if self.chain_spec().is_london_active_at_block(header.number) && BscHardforks::is_cancun_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
+        if BscHardforks::is_cancun_active_at_timestamp(self.chain_spec(), header.number, header.timestamp) {
             blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         }
         let spec = revm_spec_by_timestamp_and_block_number(
@@ -310,6 +319,7 @@ where
                 withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
             },
             header: Some(block.header().clone()),
+            is_miner: false,
         }
     }
 
@@ -318,6 +328,7 @@ where
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
         attributes: Self::NextBlockEnvCtx,
     ) -> ExecutionCtxFor<'_, Self> {
+        tracing::debug!("try to create next block ctx for miner, next_block_numer={}, parent_hash={}", parent.number+1, parent.hash());
         BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 parent_hash: parent.hash(),
@@ -326,7 +337,38 @@ where
                 withdrawals: attributes.withdrawals.map(Cow::Owned),
             },
             header: None, // No header available for next block context
+            is_miner: true,
         }
+    }
+
+    // payload builder use this method to create BscBlockBuilder.
+    fn create_block_builder<'a, DB, I>(
+        &'a self,
+        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
+        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
+    ) -> impl BlockBuilder<
+        Primitives = Self::Primitives,
+        Executor: BlockExecutorFor<'a, Self::BlockExecutorFactory, DB, I>,
+    >
+    where
+        DB: Database,
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        let bsc_executor = BscBlockExecutor::new(
+            evm,
+            ctx.clone(),
+            self.executor_factory.spec().clone(),
+            *self.executor_factory.receipt_builder(),
+            SystemContract::new(self.executor_factory.spec().clone()),
+        );
+        
+        BscBlockBuilder::new(
+            bsc_executor,
+            ctx,
+            &self.block_assembler,
+            parent,
+        )
     }
 }
 
@@ -348,6 +390,7 @@ where
                 withdrawals: block.body.inner.withdrawals.as_ref().map(Cow::Borrowed),
             },
             header: Some(block.header.clone()),
+            is_miner: false,
         }
     }
 
@@ -365,7 +408,9 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_fermi_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Fermi
+    } else if chain_spec.is_maxwell_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Maxwell
     } else if chain_spec.is_lorentz_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Lorentz
