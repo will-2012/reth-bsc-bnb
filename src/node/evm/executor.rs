@@ -30,7 +30,6 @@ use revm::{
         result::{ExecutionResult, ResultAndState},
 
     },
-    database::states::bundle_state::BundleRetention,
     state::Bytecode,
     DatabaseCommit,
 };
@@ -523,16 +522,6 @@ where
         ASSEMBLED_SYSTEM_TXS.with(|txs| {
             *txs.borrow_mut() = self.assembled_system_txs.clone();
         });
-        
-        // Merge all transitions into bundle state to ensure all state changes
-        // (including system contract calls like EIP-2935) are persisted
-        self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
-        
-        debug!(
-            target: "bsc::executor",
-            block_number = self.evm.block().number.to::<u64>(),
-            "Merged transitions into bundle state before finish"
-        );
 
         // Update receipt height metric
         let block_number = self.evm.block().number.to::<u64>();
