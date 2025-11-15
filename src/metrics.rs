@@ -51,9 +51,6 @@ pub struct BscConsensusMetrics {
     /// Current block height (equivalent to chain/head/block)
     pub current_block_height: Gauge,
     
-    /// Current header height (equivalent to chain/head/header)
-    pub current_header_height: Gauge,
-    
     /// Total number of double signs detected (equivalent to parlia/doublesign)
     pub double_signs_detected_total: Counter,
     
@@ -226,7 +223,6 @@ mod tests {
         // Test that metrics can be initialized without panicking
         let _executor_metrics = BscExecutorMetrics::default();
         let _consensus_metrics = BscConsensusMetrics::default();
-        let _network_metrics = BscNetworkMetrics::default();
         let _rewards_metrics = BscRewardsMetrics::default();
         let _vote_metrics = BscVoteMetrics::default();
         let _mev_metrics = BscMevMetrics::default();

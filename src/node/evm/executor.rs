@@ -309,7 +309,6 @@ where
         // Update current block height and header height metrics
         let block_number = block_env.number.to::<u64>();
         self.consensus_metrics.current_block_height.set(block_number as f64);
-        self.consensus_metrics.current_header_height.set(block_number as f64);
         
         // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
         if self.ctx.is_miner {

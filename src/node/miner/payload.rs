@@ -144,9 +144,6 @@ where
     /// 
     /// Returns a `Result` containing the built payload or an error.
     pub async fn build_payload(&self, args: BscBuildArguments<EthPayloadBuilderAttributes>) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
-        // Track block build start time
-
-        
         let BscBuildArguments { mut cached_reads, config, cancel } = args;
         let PayloadConfig { parent_header, attributes } = config;
 
